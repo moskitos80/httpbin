@@ -1,23 +1,22 @@
 from setuptools import setup, find_packages
-import codecs
 import os
-import re
+import io
 
-long_description = open(
-    os.path.join(os.path.dirname(__file__), 'README.rst')).read()
+# long_description = io.open(
+    # os.path.join(os.path.dirname(__file__), 'README.rst'), encoding='utf-8').read()
 
 setup(
     name="httpbin",
-    version="0.4.1",
+    version="0.6.2",
     description="HTTP Request and Response Service",
-    long_description=long_description,
+    # long_description=long_description,
 
     # The project URL.
-    url='https://github.com/Runscope/httpbin',
+    url='https://github.com/kennethreitz/httpbin',
 
     # Author details
-    author='Runscope',
-    author_email='httpbin@runscope.com',
+    author='Kenneth Reitz',
+    author_email='me@kennethreitz.org',
 
     # Choose your license
     license='MIT',
@@ -31,7 +30,11 @@ setup(
          'Programming Language :: Python :: 2.7',
          'Programming Language :: Python :: 3.4',
     ],
+    test_suite="test_httpbin",
     packages=find_packages(),
     include_package_data = True, # include files listed in MANIFEST.in
-    install_requires=['Flask','MarkupSafe','decorator','itsdangerous','six'],
+    install_requires=[
+        'Flask', 'MarkupSafe', 'decorator', 'itsdangerous', 'six', 'brotlipy',
+        'raven[flask]', 'Flask-Common', 'werkzeug>=0.14.1'
+    ],
 )

@@ -9,8 +9,12 @@ This module provides helper functions for httpbin.
 
 import json
 import base64
-from hashlib import md5
+import re
+import time
+import os
+from hashlib import md5, sha256, sha512
 from werkzeug.http import parse_authorization_header
+from werkzeug.datastructures import WWWAuthenticate
 
 from flask import request, make_response
 from six.moves.urllib.parse import urlparse, urlunparse
@@ -47,7 +51,10 @@ ENV_HEADERS = (
     'X-Forwarded-For',
     'X-Forwarded-Protocol',
     'X-Forwarded-Port',
-    'Runscope-Service'
+    'X-Request-Id',
+    'Via',
+    'Total-Route-Time',
+    'Connect-Time'
 )
 
 ROBOT_TXT = """User-agent: *
@@ -165,11 +172,10 @@ def get_url(request):
 def get_dict(*keys, **extras):
     """Returns request dict of given keys."""
 
-    _keys = ('url', 'args', 'form', 'data', 'origin', 'headers', 'files', 'json')
+    _keys = ('url', 'args', 'form', 'data', 'origin', 'headers', 'files', 'json', 'method')
 
     assert all(map(_keys.__contains__, keys))
     data = request.data
-    form = request.form
     form = semiflatten(request.form)
 
     try:
@@ -185,7 +191,8 @@ def get_dict(*keys, **extras):
         origin=request.headers.get('X-Forwarded-For', request.remote_addr),
         headers=get_headers(),
         files=get_files(),
-        json=_json
+        json=_json,
+        method=request.method,
     )
 
     out_d = dict()
@@ -260,11 +267,16 @@ def check_basic_auth(user, passwd):
 # Digest auth helpers
 # qop is a quality of protection
 
-def H(data):
-    return md5(data).hexdigest()
+def H(data, algorithm):
+    if algorithm == 'SHA-256':
+        return sha256(data).hexdigest()
+    elif algorithm == 'SHA-512':
+        return sha512(data).hexdigest()
+    else:
+        return md5(data).hexdigest()
 
 
-def HA1(realm, username, password):
+def HA1(realm, username, password, algorithm):
     """Create HA1 hash by realm, username, password
 
     HA1 = md5(A1) = MD5(username:realm:password)
@@ -273,10 +285,10 @@ def HA1(realm, username, password):
         realm = u''
     return H(b":".join([username.encode('utf-8'),
                            realm.encode('utf-8'),
-                           password.encode('utf-8')]))
+                           password.encode('utf-8')]), algorithm)
 
 
-def HA2(credentails, request):
+def HA2(credentails, request, algorithm):
     """Create HA2 md5 hash
 
     If the qop directive's value is "auth" or is unspecified, then HA2:
@@ -285,14 +297,15 @@ def HA2(credentails, request):
         HA2 = md5(A2) = MD5(method:digestURI:MD5(entityBody))
     """
     if credentails.get("qop") == "auth" or credentails.get('qop') is None:
-        return H(b":".join([request['method'].encode('utf-8'), request['uri'].encode('utf-8')]))
+        return H(b":".join([request['method'].encode('utf-8'), request['uri'].encode('utf-8')]), algorithm)
     elif credentails.get("qop") == "auth-int":
         for k in 'method', 'uri', 'body':
             if k not in request:
                 raise ValueError("%s required" % k)
-        return H("%s:%s:%s" % (request['method'],
-                               request['uri'],
-                               H(request['body'])))
+        A2 = b":".join([request['method'].encode('utf-8'),
+                        request['uri'].encode('utf-8'),
+                        H(request['body'], algorithm).encode('utf-8')])
+        return H(A2, algorithm)
     raise ValueError
 
 
@@ -310,18 +323,20 @@ def response(credentails, password, request):
     - `request`: request dict
     """
     response = None
+    algorithm = credentails.get('algorithm')
     HA1_value = HA1(
         credentails.get('realm'),
         credentails.get('username'),
-        password
+        password,
+        algorithm
     )
-    HA2_value = HA2(credentails, request)
+    HA2_value = HA2(credentails, request, algorithm)
     if credentails.get('qop') is None:
         response = H(b":".join([
-            HA1_value.encode('utf-8'), 
+            HA1_value.encode('utf-8'),
             credentails.get('nonce', '').encode('utf-8'),
             HA2_value.encode('utf-8')
-        ]))
+        ]), algorithm)
     elif credentails.get('qop') == 'auth' or credentails.get('qop') == 'auth-int':
         for k in 'nonce', 'nc', 'cnonce', 'qop':
             if k not in credentails:
@@ -331,7 +346,7 @@ def response(credentails, password, request):
                                credentails.get('nc').encode('utf-8'),
                                credentails.get('cnonce').encode('utf-8'),
                                credentails.get('qop').encode('utf-8'),
-                               HA2_value.encode('utf-8')]))
+                               HA2_value.encode('utf-8')]), algorithm)
     else:
         raise ValueError("qop value are wrong")
 
@@ -345,7 +360,10 @@ def check_digest_auth(user, passwd):
         credentails = parse_authorization_header(request.headers.get('Authorization'))
         if not credentails:
             return
-        response_hash = response(credentails, passwd, dict(uri=request.script_root + request.path,
+        request_uri = request.script_root + request.path
+        if request.query_string:
+            request_uri +=  '?' + request.query_string
+        response_hash = response(credentails, passwd, dict(uri=request_uri,
                                                            body=request.data,
                                                            method=request.method))
         if credentails.get('response') == response_hash:
@@ -412,3 +430,46 @@ def get_request_range(request_headers, upper_bound):
 
     return first_byte_pos, last_byte_pos
 
+def parse_multi_value_header(header_str):
+    """Break apart an HTTP header string that is potentially a quoted, comma separated list as used in entity headers in RFC2616."""
+    parsed_parts = []
+    if header_str:
+        parts = header_str.split(',')
+        for part in parts:
+            match = re.search('\s*(W/)?\"?([^"]*)\"?\s*', part)
+            if match is not None:
+                parsed_parts.append(match.group(2))
+    return parsed_parts
+
+
+def next_stale_after_value(stale_after):
+    try:
+        stal_after_count = int(stale_after) - 1
+        return str(stal_after_count)
+    except ValueError:
+        return 'never'
+
+
+def digest_challenge_response(app, qop, algorithm, stale = False):
+    response = app.make_response('')
+    response.status_code = 401
+
+    # RFC2616 Section4.2: HTTP headers are ASCII.  That means
+    # request.remote_addr was originally ASCII, so I should be able to
+    # encode it back to ascii.  Also, RFC2617 says about nonces: "The
+    # contents of the nonce are implementation dependent"
+    nonce = H(b''.join([
+        getattr(request, 'remote_addr', u'').encode('ascii'),
+        b':',
+        str(time.time()).encode('ascii'),
+        b':',
+        os.urandom(10)
+    ]), algorithm)
+    opaque = H(os.urandom(10), algorithm)
+
+    auth = WWWAuthenticate("digest")
+    auth.set_digest('me@kennethreitz.com', nonce, opaque=opaque,
+                    qop=('auth', 'auth-int') if qop is None else (qop,), algorithm=algorithm)
+    auth.stale = stale
+    response.headers['WWW-Authenticate'] = auth.to_header()
+    return response

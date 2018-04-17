@@ -15,14 +15,19 @@ import time
 import uuid
 import argparse
 
-from flask import Flask, Response, request, render_template, redirect, jsonify as flask_jsonify, make_response, url_for
+from flask import Flask, Response, request, render_template, redirect, jsonify as flask_jsonify, make_response, url_for, abort
+from flask_common import Common
+from six.moves import range as xrange
 from werkzeug.datastructures import WWWAuthenticate, MultiDict
 from werkzeug.http import http_date
 from werkzeug.wrappers import BaseResponse
-from six.moves import range as xrange
+from werkzeug.http import parse_authorization_header
+from raven.contrib.flask import Sentry
 
 from . import filters
-from .helpers import get_headers, status_code, get_dict, get_request_range, check_basic_auth, check_digest_auth, secure_cookie, H, ROBOT_TXT, ANGRY_ASCII
+from .helpers import get_headers, status_code, get_dict, get_request_range, check_basic_auth, check_digest_auth, \
+    secure_cookie, H, ROBOT_TXT, ANGRY_ASCII, parse_multi_value_header, next_stale_after_value, \
+    digest_challenge_response
 from .utils import weighted_choice
 from .structures import CaseInsensitiveDict
 
@@ -50,6 +55,14 @@ BaseResponse.autocorrect_location_header = False
 tmpl_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'templates')
 
 app = Flask(__name__, template_folder=tmpl_dir)
+app.debug = bool(os.environ.get('DEBUG'))
+
+# Setup Flask-Common.
+common = Common(app)
+
+# Send app errors to Sentry.
+if 'SENTRY_DSN' in os.environ:
+    sentry = Sentry(app, dsn=os.environ['SENTRY_DSN'])
 
 # Set up Bugsnag exception tracking, if desired. To use Bugsnag, install the
 # Bugsnag Python client with the command "pip install bugsnag", and set the
@@ -71,6 +84,30 @@ if os.environ.get("BUGSNAG_API_KEY") is not None:
 # -----------
 # Middlewares
 # -----------
+"""
+https://github.com/kennethreitz/httpbin/issues/340
+Adds a middleware to provide chunked request encoding support running under
+gunicorn only.
+Werkzeug required environ 'wsgi.input_terminated' to be set otherwise it
+empties the input request stream.
+- gunicorn seems to support input_terminated but does not add the environ,
+  so we add it here.
+- flask will hang and does not seem to properly terminate the request, so
+  we explicitly deny chunked requests.
+"""
+@app.before_request
+def before_request():
+    if request.environ.get('HTTP_TRANSFER_ENCODING', '').lower() == 'chunked':
+        server = request.environ.get('SERVER_SOFTWARE', '')
+        if server.lower().startswith('gunicorn/'):
+            if 'wsgi.input_terminated' in request.environ:
+                app.logger.debug("environ wsgi.input_terminated already set, keeping: %s"
+                                   % request.environ['wsgi.input_terminated'])
+            else:
+                request.environ['wsgi.input_terminated'] = 1
+        else:
+            abort(501, "Chunked requests are not supported for server %s" % server)
+
 @app.after_request
 def set_cors_headers(response):
     response.headers['Access-Control-Allow-Origin'] = request.headers.get('Origin', '*')
@@ -131,6 +168,13 @@ def view_origin():
     return jsonify(origin=request.headers.get('X-Forwarded-For', request.remote_addr))
 
 
+@app.route('/uuid')
+def view_uuid():
+    """Returns a UUID."""
+
+    return jsonify(uuid=str(uuid.uuid4()))
+
+
 @app.route('/headers')
 def view_headers():
     """Returns HTTP HEADERS."""
@@ -152,6 +196,14 @@ def view_get():
     """Returns GET Data."""
 
     return jsonify(get_dict('url', 'args', 'headers', 'origin'))
+
+
+@app.route('/anything', methods=['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'TRACE'])
+@app.route('/anything/<path:anything>', methods=['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'TRACE'])
+def view_anything(anything=None):
+    """Returns request data."""
+
+    return jsonify(get_dict('url', 'args', 'headers', 'origin', 'method', 'form', 'data', 'files', 'json'))
 
 
 @app.route('/post', methods=('POST',))
@@ -204,6 +256,15 @@ def view_deflate_encoded_content():
         'origin', 'headers', method=request.method, deflated=True))
 
 
+@app.route('/brotli')
+@filters.brotli
+def view_brotli_encoded_content():
+    """Returns Brotli-Encoded Data."""
+
+    return jsonify(get_dict(
+        'origin', 'headers', method=request.method, brotli=True))
+
+
 @app.route('/redirect/<int:n>')
 def redirect_n_times(n):
     """302 Redirects n times."""
@@ -224,9 +285,9 @@ def _redirect(kind, n, external):
     return redirect(url_for('{0}_redirect_n_times'.format(kind), n=n - 1, _external=external))
 
 
-@app.route('/redirect-to')
+@app.route('/redirect-to', methods=['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'TRACE'])
 def redirect_to():
-    """302 Redirects to the given URL."""
+    """302/3XX Redirects to the given URL."""
 
     args = CaseInsensitiveDict(request.args.items())
 
@@ -235,6 +296,10 @@ def redirect_to():
     # header to the exact string supplied.
     response = app.make_response('')
     response.status_code = 302
+    if 'status_code' in args:
+        status_code = int(args['status_code'])
+        if status_code >= 300 and status_code < 400:
+            response.status_code = status_code
     response.headers['Location'] = args['url'].encode('utf-8')
 
     return response
@@ -290,7 +355,10 @@ def view_status_code(codes):
     """Return status code or random status code if more than one are given"""
 
     if ',' not in codes:
-        code = int(codes)
+        try:
+            code = int(codes)
+        except ValueError:
+            return Response('Invalid status code', status=400)
         return status_code(code)
 
     choices = []
@@ -301,21 +369,24 @@ def view_status_code(codes):
         else:
             code, weight = choice.split(':')
 
-        choices.append((int(code), float(weight)))
+        try:
+            choices.append((int(code), float(weight)))
+        except ValueError:
+            return Response('Invalid status code', status=400)
 
     code = weighted_choice(choices)
 
     return status_code(code)
 
 
-@app.route('/response-headers')
+@app.route('/response-headers', methods=['GET', 'POST'])
 def response_headers():
     """Returns a set of response headers from the query string """
     headers = MultiDict(request.args.items(multi=True))
-    response = jsonify(headers.lists())
+    response = jsonify(list(headers.lists()))
 
     while True:
-        content_len_shown = response.headers['Content-Length']
+        original_data = response.data
         d = {}
         for key in response.headers.keys():
             value = response.headers.get_all(key)
@@ -325,7 +396,8 @@ def response_headers():
         response = jsonify(d)
         for key, value in headers.items(multi=True):
             response.headers.add(key, value)
-        if response.headers['Content-Length'] == content_len_shown:
+        response_has_changed = response.data != original_data
+        if not response_has_changed:
             break
     return response
 
@@ -406,37 +478,89 @@ def hidden_basic_auth(user='user', passwd='passwd'):
     return jsonify(authenticated=True, user=user)
 
 
+@app.route('/bearer')
+def bearer_auth():
+    """Authenticates using bearer authentication."""
+    if 'Authorization' not in request.headers:
+        response = app.make_response('')
+        response.headers['WWW-Authenticate'] = 'Bearer'
+        response.status_code = 401
+        return response
+    authorization = request.headers.get('Authorization')
+    token = authorization.lstrip('Bearer ')
+
+    return jsonify(authenticated=True, token=token)
+
+
 @app.route('/digest-auth/<qop>/<user>/<passwd>')
-def digest_auth(qop=None, user='user', passwd='passwd'):
+def digest_auth_md5(qop=None, user='user', passwd='passwd'):
+    return digest_auth(qop, user, passwd, "MD5", 'never')
+
+
+@app.route('/digest-auth/<qop>/<user>/<passwd>/<algorithm>')
+def digest_auth_nostale(qop=None, user='user', passwd='passwd', algorithm='MD5'):
+    return digest_auth(qop, user, passwd, algorithm, 'never')
+
+
+@app.route('/digest-auth/<qop>/<user>/<passwd>/<algorithm>/<stale_after>')
+def digest_auth(qop=None, user='user', passwd='passwd', algorithm='MD5', stale_after='never'):
     """Prompts the user for authorization using HTTP Digest auth"""
+    require_cookie_handling = (request.args.get('require-cookie', '').lower() in
+                               ('1', 't', 'true'))
+    if algorithm not in ('MD5', 'SHA-256', 'SHA-512'):
+        algorithm = 'MD5'
+
     if qop not in ('auth', 'auth-int'):
         qop = None
-    if 'Authorization' not in request.headers or  \
-                       not check_digest_auth(user, passwd) or \
-                       'Cookie' not in request.headers:
-        response = app.make_response('')
-        response.status_code = 401
 
-        # RFC2616 Section4.2: HTTP headers are ASCII.  That means
-        # request.remote_addr was originally ASCII, so I should be able to
-        # encode it back to ascii.  Also, RFC2617 says about nonces: "The
-        # contents of the nonce are implementation dependent"
-        nonce = H(b''.join([
-            getattr(request,'remote_addr',u'').encode('ascii'),
-            b':',
-            str(time.time()).encode('ascii'),
-            b':',
-            os.urandom(10)
-        ]))
-        opaque = H(os.urandom(10))
+    authorization = request.headers.get('Authorization')
+    credentials = None
+    if authorization:
+        credentials = parse_authorization_header(authorization)
 
-        auth = WWWAuthenticate("digest")
-        auth.set_digest('me@kennethreitz.com', nonce, opaque=opaque,
-                        qop=('auth', 'auth-int') if qop is None else (qop, ))
-        response.headers['WWW-Authenticate'] = auth.to_header()
-        response.headers['Set-Cookie'] = 'fake=fake_value'
+    if (not authorization or
+            not credentials or credentials.type.lower() != 'digest' or
+            (require_cookie_handling and 'Cookie' not in request.headers)):
+        response = digest_challenge_response(app, qop, algorithm)
+        response.set_cookie('stale_after', value=stale_after)
+        response.set_cookie('fake', value='fake_value')
         return response
-    return jsonify(authenticated=True, user=user)
+
+    if (require_cookie_handling and
+            request.cookies.get('fake') != 'fake_value'):
+        response = jsonify({'errors': ['missing cookie set on challenge']})
+        response.set_cookie('fake', value='fake_value')
+        response.status_code = 403
+        return response
+
+    current_nonce = credentials.get('nonce')
+
+    stale_after_value = None
+    if 'stale_after' in request.cookies:
+        stale_after_value = request.cookies.get('stale_after')
+
+    if ('last_nonce' in request.cookies and
+            current_nonce == request.cookies.get('last_nonce') or
+            stale_after_value == '0'):
+        response = digest_challenge_response(app, qop, algorithm, True)
+        response.set_cookie('stale_after', value=stale_after)
+        response.set_cookie('last_nonce',  value=current_nonce)
+        response.set_cookie('fake', value='fake_value')
+        return response
+
+    if not check_digest_auth(user, passwd):
+        response = digest_challenge_response(app, qop, algorithm, False)
+        response.set_cookie('stale_after', value=stale_after)
+        response.set_cookie('last_nonce', value=current_nonce)
+        response.set_cookie('fake', value='fake_value')
+        return response
+
+    response = jsonify(authenticated=True, user=user)
+    response.set_cookie('fake', value='fake_value')
+    if stale_after_value :
+        response.set_cookie('stale_after', value=next_stale_after_value(stale_after_value))
+
+    return response
 
 
 @app.route('/delay/<delay>')
@@ -455,14 +579,18 @@ def drip():
     """Drips data over a duration after an optional initial delay."""
     args = CaseInsensitiveDict(request.args.items())
     duration = float(args.get('duration', 2))
-    numbytes = int(args.get('numbytes', 10))
+    numbytes = min(int(args.get('numbytes', 10)),(10 * 1024 * 1024)) # set 10MB limit
     code = int(args.get('code', 200))
-    pause = duration / numbytes
+
+    if numbytes <= 0:
+        response = Response('number of bytes must be positive', status=400)
+        return response
 
     delay = float(args.get('delay', 0))
     if delay > 0:
         time.sleep(delay)
 
+    pause = duration / numbytes
     def generate_bytes():
         for i in xrange(numbytes):
             yield u"*".encode('utf-8')
@@ -497,6 +625,25 @@ def cache():
     else:
         return status_code(304)
 
+@app.route('/etag/<etag>', methods=('GET',))
+def etag(etag):
+    """Assumes the resource has the given etag and responds to If-None-Match and If-Match headers appropriately."""
+    if_none_match = parse_multi_value_header(request.headers.get('If-None-Match'))
+    if_match = parse_multi_value_header(request.headers.get('If-Match'))
+
+    if if_none_match:
+        if etag in if_none_match or '*' in if_none_match:
+            response = status_code(304)
+            response.headers['ETag'] = etag
+            return response
+    elif if_match:
+        if etag not in if_match and '*' not in if_match:
+            return status_code(412)
+
+    # Special cases don't apply, return normal response
+    response = view_get()
+    response.headers['ETag'] = etag
+    return response
 
 @app.route('/cache/<int:value>')
 def cache_control(value):
@@ -568,7 +715,7 @@ def range_request(numbytes):
             'Accept-Ranges' : 'bytes'
             })
         response.status_code = 404
-        response.data = 'number of bytes must be in the range (0, 10240]'
+        response.data = 'number of bytes must be in the range (0, 102400]'
         return response
 
     params = CaseInsensitiveDict(request.args.items())
@@ -582,12 +729,14 @@ def range_request(numbytes):
 
     request_headers = get_headers()
     first_byte_pos, last_byte_pos = get_request_range(request_headers, numbytes)
+    range_length = (last_byte_pos+1) - first_byte_pos
 
     if first_byte_pos > last_byte_pos or first_byte_pos not in xrange(0, numbytes) or last_byte_pos not in xrange(0, numbytes):
         response = Response(headers={
             'ETag' : 'range%d' % numbytes,
             'Accept-Ranges' : 'bytes',
-            'Content-Range' : 'bytes */%d' % numbytes
+            'Content-Range' : 'bytes */%d' % numbytes,
+            'Content-Length': '0',
             })
         response.status_code = 416
         return response
@@ -614,7 +763,9 @@ def range_request(numbytes):
         'Content-Type': 'application/octet-stream',
         'ETag' : 'range%d' % numbytes,
         'Accept-Ranges' : 'bytes',
-        'Content-Range' : content_range }
+        'Content-Length': str(range_length),
+        'Content-Range' : content_range
+    }
 
     response = Response(generate_bytes(), headers=response_headers)
 
